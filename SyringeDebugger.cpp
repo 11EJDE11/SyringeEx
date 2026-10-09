@@ -313,6 +313,29 @@ std::vector<BYTE> SyringeDebugger::RebuildInstructions(
             }
         }
 
+        // A 32-bit rel32 wraps around the 4 GB address space, so any target is reachable
+        // from any address - but the encoder range-checks the displacement in 64 bits and
+        // rejects targets more than 2 GB away. That happens whenever the caller code is
+        // allocated far from the hooked code (on Windows 9x, VirtualAllocEx memory for
+        // another process lives in the shared arena above 0x80000000). Move the target by
+        // 2^32 so the displacement is in range; the encoded rel32 is identical modulo 2^32.
+        for (ZyanU8 i = 0; i < req.operand_count; ++i)
+        {
+            if (req.operands[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+            {
+                auto const distance = static_cast<ZyanI64>(req.operands[i].imm.u)
+                    - static_cast<ZyanI64>(dstAddr);
+                if (distance > 0x7FFFFFFFll)
+                {
+                    req.operands[i].imm.u -= 0x100000000ull;
+                }
+                else if (distance < -0x80000000ll)
+                {
+                    req.operands[i].imm.u += 0x100000000ull;
+                }
+            }
+        }
+
         BYTE encoded[ZYDIS_MAX_INSTRUCTION_LENGTH];
         ZyanUSize encodedLen = sizeof(encoded);
 

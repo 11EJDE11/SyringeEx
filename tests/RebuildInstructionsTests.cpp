@@ -627,6 +627,58 @@ TEST_CASE(short_jnz_forced_near)
     CHECK(target == 0x00401016);
 }
 
+// The caller code can be more than 2 GB away from the hook (on Windows 9x, memory that
+// VirtualAllocEx gives for another process lies in the shared arena above 0x80000000).
+// rel32 wraps modulo 2^32, so the branch must still be re-encoded, not copied verbatim.
+TEST_CASE(far_destination_jnz_wraps)
+{
+    // 75 14 at 0x00415087, relocated to the shared arena
+    BYTE bytes[] = { 0x75, 0x14 };
+    DWORD origAddr = 0x00415087;
+    DWORD newAddr  = 0x9CAB2000;
+
+    auto result = SyringeDebugger::RebuildInstructions(bytes, sizeof(bytes), origAddr, newAddr);
+
+    CHECK(result.size() == 6);
+    CHECK(decode_mnemonic(result.data(), result.size()) == ZYDIS_MNEMONIC_JNZ);
+
+    DWORD target = 0;
+    CHECK(decode_branch_target(result.data(), result.size(), newAddr, &target));
+    CHECK(target == 0x0041509D);
+}
+
+TEST_CASE(far_destination_call_wraps)
+{
+    // E8 rel32 at 0x00467950 calling 0x004F9A8E, relocated to the shared arena
+    BYTE bytes[] = { 0xE8, 0x39, 0x21, 0x09, 0x00 };
+    DWORD origAddr = 0x00467950;
+    DWORD newAddr  = 0x9CAB3010;
+
+    auto result = SyringeDebugger::RebuildInstructions(bytes, sizeof(bytes), origAddr, newAddr);
+
+    CHECK(result.size() == 5);
+    CHECK(decode_mnemonic(result.data(), result.size()) == ZYDIS_MNEMONIC_CALL);
+
+    DWORD target = 0;
+    CHECK(decode_branch_target(result.data(), result.size(), newAddr, &target));
+    CHECK(target == 0x004F9A8E);
+}
+
+TEST_CASE(far_destination_backwards_jmp_wraps)
+{
+    // E9 rel32 at 0x9CAB0000 jumping to 0x00401000 - the opposite direction
+    BYTE bytes[] = { 0xE9, 0xFB, 0x0F, 0x95, 0x63 };   // 0x9CAB0005 + 0x63950FFB = 0x00401000 (mod 2^32)
+    DWORD origAddr = 0x9CAB0000;
+    DWORD newAddr  = 0x9CAB5000;
+
+    auto result = SyringeDebugger::RebuildInstructions(bytes, sizeof(bytes), origAddr, newAddr);
+
+    CHECK(result.size() == 5);
+    DWORD target = 0;
+    CHECK(decode_branch_target(result.data(), result.size(), newAddr, &target));
+    CHECK(target == 0x00401000);
+}
+
 // ---- entry point ----
 
 int main()
