@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -19,6 +18,17 @@
 #include <DbgHelp.h>
 
 using namespace std;
+
+// Log fatal setup failures without making optional export reads noisy.
+[[noreturn]] static void ThrowMemoryError(char const* const operation,
+    void const* const address, size_t const size, std::string const& exe)
+{
+    auto const error = GetLastError();
+    auto const code = error ? error : ERROR_ERRORS_ENCOUNTERED;
+    Log::WriteLine("SyringeDebugger: %s failed at %p (size=%zu, error=%lu).",
+        operation, const_cast<void*>(address), size, static_cast<unsigned long>(code));
+    throw_lasterror(code, exe);
+}
 
 void SyringeDebugger::DebugProcess(std::string_view const arguments)
 {
@@ -69,10 +79,13 @@ VirtualMemoryHandle SyringeDebugger::AllocMem(void* address, size_t size)
 
 void SyringeDebugger::MakeExecutable(VirtualMemoryHandle const& memory, size_t size)
 {
-    if (!memory.protect(size, PAGE_EXECUTE_READ)
-        || !memory.flush_instruction_cache(size))
+    if (!memory.protect(size, PAGE_EXECUTE_READ))
     {
-        throw_lasterror_or(ERROR_ERRORS_ENCOUNTERED, exe);
+        ThrowMemoryError("VirtualProtectEx", memory.get(), size, exe);
+    }
+    if (!memory.flush_instruction_cache(size))
+    {
+        ThrowMemoryError("FlushInstructionCache", memory.get(), size, exe);
     }
 }
 
@@ -557,7 +570,10 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                         // and sites are patched in address order as before, so a site still
                         // sees the patches of earlier sites that overlap it
                         MEMORY_BASIC_INFORMATION region{};
-                        VirtualQueryEx(workingHandle, sites[first].address, &region, sizeof(region));
+                        if (!VirtualQueryEx(workingHandle, sites[first].address, &region, sizeof(region)))
+                        {
+                            ThrowMemoryError("VirtualQueryEx", sites[first].address, sizeof(region), exe);
+                        }
                         auto const regionEnd = static_cast<BYTE*>(region.BaseAddress) + region.RegionSize;
 
                         auto const runStart = sites[first].address;
@@ -573,7 +589,10 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                         }
 
                         std::vector<BYTE> memory(static_cast<size_t>(runEnd - runStart));
-                        ReadMem(runStart, memory.data(), static_cast<DWORD>(memory.size()));
+                        if (!ReadMem(runStart, memory.data(), static_cast<DWORD>(memory.size())))
+                        {
+                            ThrowMemoryError("ReadProcessMemory", runStart, memory.size(), exe);
+                        }
 
                         for (auto i = first; i < last; ++i)
                         {
@@ -652,7 +671,7 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
 
                         if (!PatchCode(runStart, memory.data(), static_cast<DWORD>(memory.size())))
                         {
-                            throw_lasterror_or(ERROR_ERRORS_ENCOUNTERED, exe);
+                            ThrowMemoryError("PatchCode", runStart, memory.size(), exe);
                         }
 
                         first = last;
@@ -660,7 +679,7 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
 
                     if (!PatchMem(base, callers.data(), static_cast<DWORD>(callers.size())))
                     {
-                        throw_lasterror_or(ERROR_ERRORS_ENCOUNTERED, exe);
+                        ThrowMemoryError("WriteProcessMemory", base, callers.size(), exe);
                     }
                     MakeExecutable(pCallerCode, total);
                 }
@@ -983,30 +1002,23 @@ void SyringeDebugger::Run(std::string_view const arguments)
 
 void SyringeDebugger::StartLoaderCall(LoaderCall const& call)
 {
-    // the loader's inputs and outputs are contiguous, so one write clears the outputs and
-    // sets both names
-    struct
-    {
-        void* ModuleBase;
-        void* ProcAddress;
-        char LibName[MaxNameLength];
-        char ProcName[MaxNameLength];
-    } request{};
-
-    static_assert(offsetof(ExchangeData, ProcAddress) - offsetof(ExchangeData, ModuleBase) == offsetof(decltype(request), ProcAddress));
-    static_assert(offsetof(ExchangeData, LibName) - offsetof(ExchangeData, ModuleBase) == offsetof(decltype(request), LibName));
-    static_assert(offsetof(ExchangeData, ProcName) - offsetof(ExchangeData, ModuleBase) == offsetof(decltype(request), ProcName));
-
+    ExchangeData request{};
     strncpy_s(request.LibName, v_Libraries[call.library].name.c_str(), _TRUNCATE);
     strncpy_s(request.ProcName, call.proc.c_str(), _TRUNCATE);
 
-    PatchMem(&GetData()->ModuleBase, &request, sizeof(request));
+    if (!PatchMem(GetData(), &request, sizeof(request)))
+    {
+        ThrowMemoryError("WriteProcessMemory", GetData(), sizeof(request), exe);
+    }
 }
 
 void SyringeDebugger::FinishLoaderCall(LoaderCall const& call)
 {
     void* results[2] = {};
-    ReadMem(&GetData()->ModuleBase, results, sizeof(results));
+    if (!ReadMem(&GetData()->ModuleBase, results, sizeof(results)))
+    {
+        ThrowMemoryError("ReadProcessMemory", &GetData()->ModuleBase, sizeof(results), exe);
+    }
     auto const module = results[0];
     auto const address = results[1];
 
@@ -1220,7 +1232,10 @@ void SyringeDebugger::ApplyFeatureFlag(FeatureFlagEntry const& flag, void* const
     if (address)
     {
         BYTE const trueVal = 1;
-        PatchMem(address, &trueVal, 1);
+        if (!PatchMem(address, &trueVal, 1))
+        {
+            ThrowMemoryError("WriteProcessMemory", address, 1, exe);
+        }
         Log::WriteLine(
             __FUNCTION__ ": Set feature flag \"%s\" in \"%s\" at 0x%08X",
             flag.symbol, flag.lib, address);
