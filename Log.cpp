@@ -1,5 +1,6 @@
 #include "Log.h"
 
+#include <chrono>
 #include <share.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -27,13 +28,15 @@ void Log::WriteTimestamp() noexcept
 {
     if (File)
     {
-        time_t raw;
-        time(&raw);
+        auto const now = std::chrono::system_clock::now();
+        auto const seconds = std::chrono::floor<std::chrono::seconds>(now);
+        auto const millis = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now - seconds).count());
+        auto const raw = std::chrono::system_clock::to_time_t(seconds);
 
         tm t;
         localtime_s(&t, &raw);
 
-        fprintf(File, "[%02d:%02d:%02d] ", t.tm_hour, t.tm_min, t.tm_sec);
+        fprintf(File, "[%02d:%02d:%02d:%03d] ", t.tm_hour, t.tm_min, t.tm_sec, millis);
     }
 }
 
