@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <numeric>
@@ -386,7 +387,7 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
 
         // load the hook DLLs and resolve hook and feature flag addresses. Each call into
         // the target costs two debug events, so the DLLs are loaded once each and every
-        // address is then read from their export tables; only what that cannot resolve
+        // address is then read from their loaded export tables; only what that cannot resolve
         // goes through GetProcAddress in the target
         if (!bDLLsLoaded)
         {
@@ -1035,21 +1036,93 @@ void SyringeDebugger::FinishLoaderCall(LoaderCall const& call)
     }
 }
 
-// the export table read from the file only gives the target's addresses if the target
-// loaded that same file
-bool SyringeDebugger::ModuleMatchesFile(HookLibrary const& library)
+// Read one snapshot of the loaded module's export directory. If its tables live
+// outside the directory or cannot be read, let GetProcAddress resolve the symbols.
+bool SyringeDebugger::ReadModuleExports(HookLibrary& library)
 {
+    library.exports.clear();
     IMAGE_DOS_HEADER dos{};
     IMAGE_NT_HEADERS nt{};
+    auto const base = static_cast<BYTE*>(library.module);
+    if (!ReadMem(base, &dos, sizeof(dos))
+        || dos.e_magic != IMAGE_DOS_SIGNATURE
+        || dos.e_lfanew < 0
+        || !ReadMem(base + dos.e_lfanew, &nt, sizeof(nt))
+        || nt.Signature != IMAGE_NT_SIGNATURE
+        || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC
+        || nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT)
+    {
+        return false;
+    }
 
-    return library.size_of_image
-        && ReadMem(library.module, &dos, sizeof(dos))
-        && dos.e_magic == IMAGE_DOS_SIGNATURE
-        && ReadMem(static_cast<BYTE*>(library.module) + dos.e_lfanew, &nt, sizeof(nt))
-        && nt.Signature == IMAGE_NT_SIGNATURE
-        && nt.FileHeader.TimeDateStamp == library.file_header.TimeDateStamp
-        && nt.FileHeader.NumberOfSections == library.file_header.NumberOfSections
-        && nt.OptionalHeader.SizeOfImage == library.size_of_image;
+    auto const& dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress && !dir.Size)
+    {
+        return true;
+    }
+    auto const imageSize = nt.OptionalHeader.SizeOfImage;
+    if (!dir.VirtualAddress || dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY)
+        || dir.VirtualAddress >= imageSize || dir.Size > imageSize - dir.VirtualAddress)
+    {
+        return false;
+    }
+
+    std::vector<BYTE> bytes(dir.Size);
+    if (!ReadMem(base + dir.VirtualAddress, bytes.data(), dir.Size))
+    {
+        return false;
+    }
+
+    // Subtraction-based checks avoid overflow in RVA and array-size arithmetic.
+    auto const contains = [&](DWORD rva, size_t count, size_t elementSize)
+    {
+        if (rva < dir.VirtualAddress)
+        {
+            return false;
+        }
+        size_t const offset = rva - dir.VirtualAddress;
+        return offset <= bytes.size() && count <= (bytes.size() - offset) / elementSize;
+    };
+
+    IMAGE_EXPORT_DIRECTORY exports{};
+    std::memcpy(&exports, bytes.data(), sizeof(exports));
+    if (!exports.NumberOfNames)
+    {
+        return true;
+    }
+    if (!contains(exports.AddressOfNames, exports.NumberOfNames, sizeof(DWORD))
+        || !contains(exports.AddressOfNameOrdinals, exports.NumberOfNames, sizeof(WORD))
+        || !contains(exports.AddressOfFunctions, exports.NumberOfFunctions, sizeof(DWORD)))
+    {
+        return false;
+    }
+
+    for (DWORD i = 0; i < exports.NumberOfNames; ++i)
+    {
+        DWORD nameRva;
+        WORD ordinal;
+        DWORD rva;
+        std::memcpy(&nameRva, bytes.data() + (exports.AddressOfNames - dir.VirtualAddress) + i * sizeof(DWORD), sizeof(nameRva));
+        std::memcpy(&ordinal, bytes.data() + (exports.AddressOfNameOrdinals - dir.VirtualAddress) + i * sizeof(WORD), sizeof(ordinal));
+        if (ordinal >= exports.NumberOfFunctions || !contains(nameRva, 1, 1))
+        {
+            return false;
+        }
+        std::memcpy(&rva, bytes.data() + (exports.AddressOfFunctions - dir.VirtualAddress) + ordinal * sizeof(DWORD), sizeof(rva));
+        if (rva >= imageSize)
+        {
+            return false;
+        }
+        auto const name = reinterpret_cast<char const*>(bytes.data() + (nameRva - dir.VirtualAddress));
+        auto const end = static_cast<char const*>(std::memchr(name, 0, bytes.size() - (nameRva - dir.VirtualAddress)));
+        if (!end)
+        {
+            return false;
+        }
+        bool const forwarded = rva >= dir.VirtualAddress && rva - dir.VirtualAddress < dir.Size;
+        library.exports.emplace(std::string(name, end), PEExport{ rva, forwarded });
+    }
+    return true;
 }
 
 void SyringeDebugger::ResolveFromExports()
@@ -1059,20 +1132,20 @@ void SyringeDebugger::ResolveFromExports()
 
     for (size_t i = 0; i < v_Libraries.size(); ++i)
     {
-        auto const& library = v_Libraries[i];
+        auto& library = v_Libraries[i];
         byName.emplace(library.name, i);
-        usable[i] = library.module && ModuleMatchesFile(library);
+        usable[i] = library.module && ReadModuleExports(library);
 
         if (library.module && !usable[i])
         {
             Log::WriteLine(
-                __FUNCTION__ ": \"%s\" in the process does not match the file its hooks "
-                "were read from; resolving them one by one.", library.name.c_str());
+                __FUNCTION__ ": Could not read exports from loaded \"%s\"; resolving them one by one.",
+                library.name.c_str());
         }
     }
 
     // an address, null where GetProcAddress would return null, or nothing where only
-    // GetProcAddress in the target can tell (a forwarded export, or an unverified module)
+    // GetProcAddress in the target can tell (a forwarded export, or an unreadable export directory)
     auto const resolve = [&](size_t const i, char const* const name) -> std::optional<void*>
     {
         auto const& library = v_Libraries[i];
@@ -1088,7 +1161,7 @@ void SyringeDebugger::ResolveFromExports()
         }
 
         auto const it = library.exports.find(name);
-        if (it == library.exports.end())
+        if (it == library.exports.end() || !it->second.RVA)
         {
             return nullptr;
         }
@@ -1358,20 +1431,6 @@ void SyringeDebugger::FindDLLs()
 
                 auto& library = v_Libraries.emplace_back();
                 library.name = hook->lib;
-                library.file_header = {};
-                library.size_of_image = 0;
-
-                try
-                {
-                    PortableExecutable const DLL{ hook->lib };
-                    library.exports = DLL.ReadExports();
-                    library.file_header = DLL.GetPEHeader().FileHeader;
-                    library.size_of_image = DLL.GetPEHeader().OptionalHeader.SizeOfImage;
-                }
-                catch (...)
-                {
-                    // no export table to use; everything resolves in the target instead
-                }
             }
         }
     }

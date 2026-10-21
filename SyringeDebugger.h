@@ -175,13 +175,17 @@ private:
     // patch sites closer together than this are read and written in one go
     static constexpr size_t MaxPatchGap = 0x1000u;
 
+    struct PEExport
+    {
+        DWORD RVA;
+        bool Forwarded;
+    };
+
     // a DLL that hooks live in, and the module the target loaded for it
     struct HookLibrary
     {
         std::string name;
         std::unordered_map<std::string, PEExport> exports;
-        IMAGE_FILE_HEADER file_header;
-        DWORD size_of_image;
         void* module{ nullptr };
     };
 
@@ -206,7 +210,7 @@ private:
     void StartLoaderCall(LoaderCall const& call);
     void FinishLoaderCall(LoaderCall const& call);
     void ResolveFromExports();
-    bool ModuleMatchesFile(HookLibrary const& library);
+    bool ReadModuleExports(HookLibrary& library);
     void ApplyFeatureFlag(FeatureFlagEntry const& flag, void* address);
 
     // feature flags

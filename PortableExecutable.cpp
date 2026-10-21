@@ -150,58 +150,6 @@ bool PortableExecutable::ReadCString(
     return false;
 }
 
-std::unordered_map<std::string, PEExport> PortableExecutable::ReadExports() const
-{
-    std::unordered_map<std::string, PEExport> result;
-
-    auto const& dir = uPEHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!dir.VirtualAddress || !dir.Size)
-    {
-        return result;
-    }
-
-    IMAGE_EXPORT_DIRECTORY exports;
-    if (!ReadBytes(VirtualToRaw(dir.VirtualAddress), sizeof(exports), &exports))
-    {
-        return result;
-    }
-
-    std::vector<DWORD> functions(exports.NumberOfFunctions);
-    std::vector<DWORD> names(exports.NumberOfNames);
-    std::vector<WORD> ordinals(exports.NumberOfNames);
-
-    if ((!functions.empty() && !ReadBytes(VirtualToRaw(exports.AddressOfFunctions), functions.size() * sizeof(DWORD), functions.data()))
-        || (!names.empty() && !ReadBytes(VirtualToRaw(exports.AddressOfNames), names.size() * sizeof(DWORD), names.data()))
-        || (!ordinals.empty() && !ReadBytes(VirtualToRaw(exports.AddressOfNameOrdinals), ordinals.size() * sizeof(WORD), ordinals.data())))
-    {
-        return result;
-    }
-
-    auto const pFile = this->Handle.get();
-    std::string name;
-
-    for (size_t i = 0; i < names.size(); ++i)
-    {
-        if (ordinals[i] >= functions.size()
-            || fseek(pFile, static_cast<long>(VirtualToRaw(names[i])), SEEK_SET))
-        {
-            continue;
-        }
-
-        name.clear();
-        for (int c; (c = fgetc(pFile)) != EOF && c != '\0';)
-        {
-            name.push_back(static_cast<char>(c));
-        }
-
-        auto const rva = functions[ordinals[i]];
-        bool const forwarded = rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size;
-        result.emplace(name, PEExport{ rva, forwarded });
-    }
-
-    return result;
-}
-
 IMAGE_SECTION_HEADER const* PortableExecutable::FindSection(
     std::string_view const name) const noexcept
 {

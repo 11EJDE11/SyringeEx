@@ -9,7 +9,6 @@
 
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
@@ -35,12 +34,6 @@ struct PEImport
     std::string Name;
 
     std::vector<PEThunkData> vecThunkData;
-};
-
-struct PEExport
-{
-    DWORD RVA;
-    bool Forwarded; // RVA points at a forwarder string, not at code or data
 };
 
 class PortableExecutable
@@ -115,9 +108,6 @@ public:
 
     IMAGE_SECTION_HEADER const* FindSection(
         std::string_view name) const noexcept;
-
-    // exports by name, as GetProcAddress looks them up
-    std::unordered_map<std::string, PEExport> ReadExports() const;
 
 private:
     bool ReadFile();
