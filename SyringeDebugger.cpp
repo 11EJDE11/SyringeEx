@@ -10,6 +10,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -513,10 +514,13 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                     BreakpointInfo const* info;
                     size_t overridden;
                     size_t offset; // of its caller code in the allocation
+                    size_t capacity;
                 };
 
                 std::vector<Site> sites;
                 size_t total = 0;
+                auto const callerLimit = std::min<size_t>(std::numeric_limits<DWORD>::max(),
+                    std::vector<BYTE>{}.max_size());
 
                 for (auto& it : Breakpoints)
                 {
@@ -527,7 +531,7 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
 
                     auto const [count, overridden] = std::accumulate(
                         it.second.hooks.cbegin(), it.second.hooks.cend(),
-                        std::make_pair(0u, 0u), [](auto acc, auto const& hook)
+                        std::make_pair(size_t{0}, size_t{0}), [](auto acc, auto const& hook)
                         {
                             if (hook.proc_address) {
                                 if (acc.second < hook.num_overridden) {
@@ -542,12 +546,21 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                         continue;
                     }
 
-                    sites.push_back({ static_cast<BYTE*>(it.first), &it.second, overridden, total });
-
-                    // use a conservative upper bound for rebuilt instructions,
-                    // since relative instruction re-encoding may change sizes
-                    // (e.g. short branch -> near branch)
-                    total += count * sizeof(code_call) + sizeof(jmp_back) + overridden * 3;
+                    // Check each term before multiplying or adding. The whole block must
+                    // also fit the DWORD size accepted by PatchMem.
+                    auto const remaining = callerLimit - total;
+                    if (remaining < sizeof(jmp_back)
+                        || count > (remaining - sizeof(jmp_back)) / sizeof(code_call)
+                        || overridden > (remaining - sizeof(jmp_back) - count * sizeof(code_call)) / 3)
+                    {
+                        Log::WriteLine("SyringeDebugger: Caller size overflow at %p (hooks=%zu, overridden=%zu, total=%zu).",
+                            it.first, count, overridden, total);
+                        throw_lasterror(ERROR_ARITHMETIC_OVERFLOW, exe);
+                    }
+                    // Relative instruction re-encoding may expand the overwritten bytes.
+                    auto const capacity = count * sizeof(code_call) + sizeof(jmp_back) + overridden * 3;
+                    sites.push_back({ static_cast<BYTE*>(it.first), &it.second, overridden, total, capacity });
+                    total += capacity;
                 }
 
                 if (!sites.empty())
@@ -621,6 +634,7 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                             auto const& site = sites[i];
                             auto const original = memory.data() + (site.address - runStart);
                             auto const callerStart = callers.data() + site.offset;
+                            auto const callerEnd = callerStart + site.capacity;
                             auto p_code = callerStart;
 
                             auto const remote = [&](BYTE const* local)
@@ -674,6 +688,14 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                                     original, site.overridden, originalAddr, newAddr,
                                     rebuildLibraryNames);
 
+                                // Leave room for the jump back inside this site's slot.
+                                auto const remaining = static_cast<size_t>(callerEnd - p_code);
+                                if (remaining < sizeof(jmp_back) || rebuilt.size() > remaining - sizeof(jmp_back))
+                                {
+                                    Log::WriteLine("SyringeDebugger: Caller buffer too small at %p (rebuilt=%zu, remaining=%zu, jump=%zu).",
+                                        site.address, rebuilt.size(), remaining, sizeof(jmp_back));
+                                    throw_lasterror(ERROR_INSUFFICIENT_BUFFER, exe);
+                                }
                                 std::memcpy(p_code, rebuilt.data(), rebuilt.size());
                                 p_code += rebuilt.size();
                             }
