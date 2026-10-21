@@ -565,16 +565,14 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
 
                     for (size_t first = 0; first < sites.size();)
                     {
-                        // nearby sites are patched through one read and one write. A run stays
-                        // inside one memory region, so the write meets a single protection,
-                        // and sites are patched in address order as before, so a site still
-                        // sees the patches of earlier sites that overlap it
+                        // Batch within one region, but keep overlapping sites together
+                        // across boundaries so each sees the previous sites' patches.
                         MEMORY_BASIC_INFORMATION region{};
                         if (!VirtualQueryEx(workingHandle, sites[first].address, &region, sizeof(region)))
                         {
                             ThrowMemoryError("VirtualQueryEx", sites[first].address, sizeof(region), exe);
                         }
-                        auto const regionEnd = static_cast<BYTE*>(region.BaseAddress) + region.RegionSize;
+                        auto regionEnd = static_cast<BYTE*>(region.BaseAddress) + region.RegionSize;
 
                         auto const runStart = sites[first].address;
                         auto runEnd = patchEnd(sites[first]);
@@ -582,16 +580,32 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
 
                         while (last < sites.size()
                             && sites[last].address <= runEnd + MaxPatchGap
-                            && patchEnd(sites[last]) <= regionEnd)
+                            && (patchEnd(sites[last]) <= regionEnd || sites[last].address < runEnd))
                         {
                             runEnd = std::max(runEnd, patchEnd(sites[last]));
                             ++last;
                         }
 
                         std::vector<BYTE> memory(static_cast<size_t>(runEnd - runStart));
-                        if (!ReadMem(runStart, memory.data(), static_cast<DWORD>(memory.size())))
+                        std::vector<size_t> regionEnds;
+                        for (size_t offset = 0; offset < memory.size();)
                         {
-                            ThrowMemoryError("ReadProcessMemory", runStart, memory.size(), exe);
+                            auto const end = std::min(runEnd, regionEnd);
+                            auto const size = static_cast<DWORD>(end - (runStart + offset));
+                            if (!ReadMem(runStart + offset, memory.data() + offset, size))
+                            {
+                                ThrowMemoryError("ReadProcessMemory", runStart + offset, size, exe);
+                            }
+                            offset += size;
+                            regionEnds.push_back(offset);
+                            if (offset < memory.size())
+                            {
+                                if (!VirtualQueryEx(workingHandle, runStart + offset, &region, sizeof(region)))
+                                {
+                                    ThrowMemoryError("VirtualQueryEx", runStart + offset, sizeof(region), exe);
+                                }
+                                regionEnd = static_cast<BYTE*>(region.BaseAddress) + region.RegionSize;
+                            }
                         }
 
                         for (auto i = first; i < last; ++i)
@@ -669,9 +683,14 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                             ApplyPatch(original + 0x01, rel2);
                         }
 
-                        if (!PatchCode(runStart, memory.data(), static_cast<DWORD>(memory.size())))
+                        size_t offset = 0;
+                        for (auto const end : regionEnds)
                         {
-                            ThrowMemoryError("PatchCode", runStart, memory.size(), exe);
+                            if (!PatchCode(runStart + offset, memory.data() + offset, static_cast<DWORD>(end - offset)))
+                            {
+                                ThrowMemoryError("PatchCode", runStart + offset, end - offset, exe);
+                            }
+                            offset = end;
                         }
 
                         first = last;
