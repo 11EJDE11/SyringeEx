@@ -563,6 +563,14 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                         return site.address + std::max(site.overridden, sizeof(jmp));
                     };
 
+                    struct PreparedPatch
+                    {
+                        BYTE* address;
+                        std::vector<BYTE> bytes;
+                        std::vector<size_t> regionEnds;
+                    };
+                    std::vector<PreparedPatch> patches;
+
                     for (size_t first = 0; first < sites.size();)
                     {
                         // Batch within one region, but keep overlapping sites together
@@ -683,15 +691,7 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                             ApplyPatch(original + 0x01, rel2);
                         }
 
-                        size_t offset = 0;
-                        for (auto const end : regionEnds)
-                        {
-                            if (!PatchCode(runStart + offset, memory.data() + offset, static_cast<DWORD>(end - offset)))
-                            {
-                                ThrowMemoryError("PatchCode", runStart + offset, end - offset, exe);
-                            }
-                            offset = end;
-                        }
+                        patches.push_back({ runStart, std::move(memory), std::move(regionEnds) });
 
                         first = last;
                     }
@@ -701,6 +701,20 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                         ThrowMemoryError("WriteProcessMemory", base, callers.size(), exe);
                     }
                     MakeExecutable(pCallerCode, total);
+
+                    // Publish jumps only when all callers are ready and executable.
+                    for (auto const& patch : patches)
+                    {
+                        size_t offset = 0;
+                        for (auto const end : patch.regionEnds)
+                        {
+                            if (!PatchCode(patch.address + offset, patch.bytes.data() + offset, static_cast<DWORD>(end - offset)))
+                            {
+                                ThrowMemoryError("PatchCode", patch.address + offset, end - offset, exe);
+                            }
+                            offset = end;
+                        }
+                    }
                 }
 
                 Log::Flush();
