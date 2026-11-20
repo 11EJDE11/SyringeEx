@@ -468,8 +468,20 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                 // https://devblogs.microsoft.com/oldnewthing/20190418-00/?p=102428
                 // https://web.archive.org/web/20250707201905/http://www.nynaeve.net/?p=98
 
-                #define POPFD_POPAD \
-                    0x9D, /* POPFD */ \
+                // Restores the saved flags. POPFD is avoided because it is slow.
+                // STD only ever sets DF, because hook functions return with DF clear.
+                // TF, AC, NT and ID are left alone. EAX is scratch: the POPAD replica
+                // reloads it with POP and MOV only, so the restored flags stay intact.
+                #define RESTORE_FLAGS_POPAD \
+                    0x58, /* POP EAX (saved EFLAGS image) */ \
+                    0x0F, 0xBA, 0xE0, 0x0A, /* BT EAX, 10 (CF = DF) */ \
+                    0x73, 0x01, /* JNC +1 */ \
+                    0xFD, /* STD */ \
+                    0xC0, 0xE4, 0x04, /* SHL AH, 4 (bit 7 = OF) */ \
+                    0x80, 0xE4, 0x80, /* AND AH, 0x80 */ \
+                    0x00, 0xE4, /* ADD AH, AH (OF = saved OF) */ \
+                    0x88, 0xC4, /* MOV AH, AL */ \
+                    0x9E, /* SAHF (SF, ZF, AF, PF, CF) */ \
                     /* start POPAD replica */ \
                     0x5F, /* POP EDI */ \
                     0x5E, /* POP ESI */ \
@@ -492,14 +504,14 @@ DWORD SyringeDebugger::HandleException(DEBUG_EVENT const& dbgEvent)
                     0x83, 0xC4, 0x08, // ADD ESP, 8
                     0x64, /* FS segment prefix */ 0xA3, 0x14, 0x00, 0x00, 0x00, // MOV fs:0x14, EAX
                     0x64, /* FS segment prefix */ 0x83, 0x3D, 0x14, 0x00, 0x00, 0x00, 0x00, // CMP DWORD PTR fs:0x14, 0
-                    0x74, 0x18, // JE proceed
+                    0x74, 0x2A, // JE proceed
 
                     // jmp_to_address:
-                    POPFD_POPAD,
+                    RESTORE_FLAGS_POPAD,
                     0x64, /* FS segment prefix */ 0xFF, 0x25, 0x14, 0x00, 0x00, 0x00, // JMP DWORD PTR fs:0x14
 
                     // proceed:
-                    POPFD_POPAD,
+                    RESTORE_FLAGS_POPAD,
                     // here will be the overwritten bytes and jump back
                 };
 
